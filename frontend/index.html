@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Inference Server Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #3fb950;
+    --accent2: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 20px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  textarea, input[type=text], input[type=number] {
+    width: 100%;
+    background: #0d1117;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  button {
+    background: var(--accent2);
+    color: #0d1117;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    margin-top: 8px;
+  }
+  button:hover { opacity: 0.9; }
+  button.secondary { background: var(--accent); }
+  #streamOutput {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    min-height: 80px;
+    margin-top: 10px;
+    font-size: 13px;
+    white-space: pre-wrap;
+  }
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .stat-row span:first-child { color: var(--muted); }
+  .stat-row span:last-child { color: var(--accent2); font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input { width: 80px; }
+  #fireResults { margin-top: 10px; font-size: 12px; color: var(--muted); max-height: 150px; overflow-y: auto; }
+</style>
+</head>
+<body>
+
+<h1>LLM Inference Server — Live Dashboard</h1>
+<div class="sub">Static batching vs. continuous batching, live queue/throughput stats</div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Streaming Generation</h2>
+      <textarea id="promptInput" rows="2">The capital of France is</textarea>
+      <button onclick="streamGenerate()">Generate (streaming)</button>
+      <div id="streamOutput"></div>
+    </div>
+
+    <div class="panel" style="margin-top: 20px;">
+      <h2>Load Test — Fire Concurrent Requests</h2>
+      <div class="row">
+        <label>Count:</label>
+        <input type="number" id="fireCount" value="8" min="1" max="32">
+        <label>Endpoint:</label>
+        <select id="fireEndpoint">
+          <option value="/generate">Static batching</option>
+          <option value="/generate_continuous">Continuous batching</option>
+        </select>
+        <button class="secondary" onclick="fireConcurrent()">Fire requests</button>
+      </div>
+      <div id="fireResults"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Live Status</h2>
+      <div class="stat-row"><span>Static queue depth</span><span id="staticQueue">-</span></div>
+      <div class="stat-row"><span>Continuous queue depth</span><span id="contQueue">-</span></div>
+      <div class="stat-row"><span>Continuous active slots</span><span id="contActive">-</span></div>
+      <div class="stat-row"><span>Static throughput (tok/s)</span><span id="staticThroughput">-</span></div>
+      <div class="stat-row"><span>Continuous throughput (tok/s)</span><span id="contThroughput">-</span></div>
+      <div class="stat-row"><span>Static avg latency (s)</span><span id="staticLatency">-</span></div>
+      <div class="stat-row"><span>Continuous avg latency (s)</span><span id="contLatency">-</span></div>
+    </div>
+
+    <div class="panel" style="margin-top: 20px;">
+      <h2>Throughput Over Time</h2>
+      <canvas id="throughputChart" height="160"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE_URL = "http://localhost:8000";
+
+// --- Streaming generation ---
+async function streamGenerate() {
+  const prompt = document.getElementById("promptInput").value;
+  const outputEl = document.getElementById("streamOutput");
+  outputEl.textContent = "";
+
+  const resp = await fetch(`${BASE_URL}/generate_stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, max_new_tokens: 40 }),
+  });
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        outputEl.textContent += line.slice(6);
+      }
+    }
+  }
+}
+
+// --- Fire N concurrent requests ---
+async function fireConcurrent() {
+  const count = parseInt(document.getElementById("fireCount").value);
+  const endpoint = document.getElementById("fireEndpoint").value;
+  const resultsEl = document.getElementById("fireResults");
+  resultsEl.textContent = `Firing ${count} requests to ${endpoint}...`;
+
+  const start = performance.now();
+  const requests = Array.from({ length: count }, () =>
+    fetch(`${BASE_URL}${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: "The capital of France is", max_new_tokens: 20 }),
+    }).then(r => r.json())
+  );
+
+  await Promise.all(requests);
+  const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+  const totalTokens = count * 20;
+  const throughput = (totalTokens / elapsed).toFixed(2);
+  resultsEl.textContent = `Done: ${count} requests in ${elapsed}s → ${throughput} tokens/sec`;
+}
+
+// --- Live status + throughput chart ---
+const ctx = document.getElementById("throughputChart");
+const chart = new Chart(ctx, {
+  type: "line",
+  data: {
+    labels: [],
+    datasets: [
+      { label: "Static", data: [], borderColor: "#58a6ff", tension: 0.3 },
+      { label: "Continuous", data: [], borderColor: "#3fb950", tension: 0.3 },
+    ],
+  },
+  options: {
+    responsive: true,
+    scales: {
+      x: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } },
+      y: { ticks: { color: "#8b949e" }, grid: { color: "#30363d" } },
+    },
+    plugins: { legend: { labels: { color: "#c9d1d9" } } },
+  },
+});
+
+let tick = 0;
+async function pollStatus() {
+  try {
+    const [statusRes, metricsRes] = await Promise.all([
+      fetch(`${BASE_URL}/status`).then(r => r.json()),
+      fetch(`${BASE_URL}/metrics`).then(r => r.json()),
+    ]);
+
+    document.getElementById("staticQueue").textContent = statusRes.static_queue_depth;
+    document.getElementById("contQueue").textContent = statusRes.continuous_queue_depth;
+    document.getElementById("contActive").textContent = statusRes.continuous_active_slots;
+
+    const staticStats = metricsRes.static_batching;
+    const contStats = metricsRes.continuous_batching;
+
+    document.getElementById("staticThroughput").textContent = staticStats.throughput_tokens_per_sec ?? "-";
+    document.getElementById("contThroughput").textContent = contStats.throughput_tokens_per_sec ?? "-";
+    document.getElementById("staticLatency").textContent = staticStats.avg_latency ?? "-";
+    document.getElementById("contLatency").textContent = contStats.avg_latency ?? "-";
+
+    tick += 1;
+    chart.data.labels.push(tick);
+    chart.data.datasets[0].data.push(staticStats.throughput_tokens_per_sec ?? 0);
+    chart.data.datasets[1].data.push(contStats.throughput_tokens_per_sec ?? 0);
+    if (chart.data.labels.length > 20) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+      chart.data.datasets[1].data.shift();
+    }
+    chart.update();
+  } catch (e) {
+    console.error("Poll failed:", e);
+  }
+}
+
+setInterval(pollStatus, 1500);
+pollStatus();
+</script>
+
+</body>
+</html>
